@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://qingyuna.github.io/answer-me-with-html/"><b>Website</b></a>: try the real renderer in your browser
+  <a href="https://answer-me-with-html.com/"><b>Website</b></a>: try the real renderer in your browser
 </p>
 
 <p align="center">
