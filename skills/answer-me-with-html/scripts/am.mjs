@@ -10558,7 +10558,7 @@ import { createServer } from "node:http";
 import { connect as connect2, isIP } from "node:net";
 import { networkInterfaces, uptime } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync as readFileSync8, writeFileSync as writeFileSync6, renameSync as renameSync5, rmSync as rmSync6, watch } from "node:fs";
+import { readFileSync as readFileSync8, writeFileSync as writeFileSync6, renameSync as renameSync5, rmSync as rmSync6, statSync as statSync4, watch } from "node:fs";
 import { lstat, realpath, readFile, stat } from "node:fs/promises";
 import { join as join10, resolve as resolve3, dirname as dirname2, basename as basename3, sep as sep3 } from "node:path";
 var DEFAULT_PORT = 8765;
@@ -10624,6 +10624,38 @@ var ServeError = class extends Error {
   }
 };
 var infoPath = (home) => join10(home, "serve.json");
+var newSecret = () => randomBytes(32).toString("hex");
+var SECRET_FILE_CONTENT = /^[0-9a-f]{64}(\r?\n)?$/;
+var checksMode = process.platform !== "win32";
+function readSecretFile(path) {
+  const file = resolve3(path);
+  const read = () => {
+    const info = statSync4(file);
+    if (!info.isFile()) throw new ServeError(`--secret-file ${file} is not a regular file`);
+    if (checksMode && (info.mode & 63) !== 0) {
+      throw new ServeError(`--secret-file ${file} can be read by other users (mode ${(info.mode & 511).toString(8)}); run chmod 600 on it`);
+    }
+    if (info.size > 128) throw new ServeError(`--secret-file ${file} does not hold a secret: expected 64 hex characters (0-9, a-f)`);
+    const text = readFileSync8(file, "utf8");
+    if (!SECRET_FILE_CONTENT.test(text)) throw new ServeError(`--secret-file ${file} does not hold a secret: expected 64 hex characters (0-9, a-f)`);
+    return text.slice(0, 64);
+  };
+  try {
+    return read();
+  } catch (e) {
+    if (e instanceof ServeError) throw e;
+    if (e.code !== "ENOENT") throw new ServeError(`Cannot read --secret-file ${file}: ${e.message}`);
+  }
+  const secret = newSecret();
+  try {
+    writeFileSync6(file, `${secret}
+`, { mode: 384, flag: "wx" });
+  } catch (e) {
+    if (e.code === "EEXIST") return read();
+    throw new ServeError(`Cannot create --secret-file ${file}: ${e.message}`);
+  }
+  return secret;
+}
 function pageToken(secret, dir, file) {
   return createHmac("sha256", secret).update(`${dir}/${file}`).digest("base64url").slice(0, TOKEN_LENGTH);
 }
@@ -10872,7 +10904,7 @@ function listening(port, timeout = 500) {
     socket.once("error", () => end(false));
   });
 }
-async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, lanAddresses }) {
+async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, lanAddresses, secretFile }) {
   const addresses = lan ? lanAddresses ?? lanIPv4Addresses() : [];
   if (lan && (!addresses.length || addresses.some((address) => isIP(address) !== 4 || address === LAN_BIND || address.startsWith("127.")))) {
     throw new ServeError("--lan needs at least one active non-loopback IPv4 interface");
@@ -10881,7 +10913,7 @@ async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, 
   const allowedHosts = [...addresses, ...publicOrigin ? [new URL(publicOrigin).host] : []];
   const running = readServeInfo(home);
   if (running && await listening(running.port)) throw new ServeError(`am serve is already running on ${running.baseUrl ?? `http://${HOST}:${running.port}`} (pid ${running.pid}); stop it first`);
-  const secret = randomBytes(32).toString("hex");
+  const secret = secretFile === void 0 ? newSecret() : readSecretFile(secretFile);
   const live = liveStreams(home);
   const server = createServer(handler(home, secret, allowedHosts, live));
   await new Promise((done, fail) => {
@@ -10909,10 +10941,10 @@ async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, 
   };
   return { port: actual, secret, close, baseUrl, addresses, lan };
 }
-async function runServe({ home, port, lan = false, publicUrl, print, fail }) {
+async function runServe({ home, port, lan = false, publicUrl, secretFile, print, fail }) {
   let srv;
   try {
-    srv = await startServer({ home, port, lan, publicUrl });
+    srv = await startServer({ home, port, lan, publicUrl, secretFile });
   } catch (e) {
     if (!(e instanceof ServeError)) throw e;
     fail(`\u2717 ${e.message}`);
@@ -10932,6 +10964,7 @@ async function runServe({ home, port, lan = false, publicUrl, print, fail }) {
       print(`Serving pages on http://${HOST}:${srv.port} (Ctrl-C to stop). am render prints a link for each page.`);
       if (!publicUrl) print(`Reaching it from another computer: run ssh -L ${srv.port}:${HOST}:${srv.port} user@host there, then open the links in its browser.`);
     }
+    if (secretFile !== void 0) print(`Secret file: ${resolve3(secretFile)}. Links stay valid after a restart; delete the file to revoke them all.`);
     if (publicUrl) {
       print(`Public link origin: ${srv.baseUrl}`);
       if (srv.baseUrl.startsWith("http://")) print("WARNING: --public-url uses HTTP; links and their capability tokens are not encrypted in transit.");
@@ -10953,7 +10986,9 @@ Usage:
                                                   render a video draft into a 3b1b-style explainer video player page (--mp4 / --webm also save a video file)
   am lint   <file|->  [--style off|80|strict]     run only the STE controlled-writing check
   am config [set <key> <value> | get <key> | reset [key]]  show or change settings
-  am serve  [--port 8765] [--lan] [--public-url <origin>]  serve pages over http on 127.0.0.1 (--lan: on the local network); am render then prints a link:
+  am serve  [--port 8765] [--lan] [--public-url <origin>] [--secret-file <path>]
+                                                  serve pages over http on 127.0.0.1 (--lan: on the local network; --secret-file: links
+                                                  stay valid after a restart); am render then prints a link:
   am clean  [--days 30] [--all] [--dry-run]       delete old pages, old videos and the voice-over cache
   am theme check <name|file.json> [--no-open]     check a theme's colors and contrast, and render specimen pages
   am theme add <name> [--use] [--force]           install a theme from the catalog (answer-me-with-html.com/themes/); --use makes it the default
@@ -11133,6 +11168,7 @@ async function main(argv, io = {}) {
         port: { type: "string" },
         lan: { type: "boolean" },
         "public-url": { type: "string" },
+        "secret-file": { type: "string" },
         all: { type: "boolean" },
         "dry-run": { type: "boolean" },
         use: { type: "boolean" },
@@ -11556,7 +11592,7 @@ function cmdServe(opts, { print, fail, env }) {
     return 2;
   }
   const port = opts.port === void 0 ? DEFAULT_PORT : Number(opts.port);
-  return runServe({ home: amHome(env), port, lan: !!opts.lan, publicUrl: opts["public-url"], print, fail });
+  return runServe({ home: amHome(env), port, lan: !!opts.lan, publicUrl: opts["public-url"], secretFile: opts["secret-file"], print, fail });
 }
 function cmdLint(src, opts, { print, fail }) {
   let doc2;

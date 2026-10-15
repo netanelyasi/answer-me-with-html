@@ -1,7 +1,8 @@
 // am serve: a foreground HTTP server on 127.0.0.1 that serves rendered pages through per-page capability links.
 // Every start makes a new secret and writes it to serve.json (mode 0600, removed on exit). A link is /p/<token>/<file> (pages) or
 // /v/<token>/<file> (videos), with token = HMAC-SHA256(secret, "<dir>/<file>"). The server keeps no list of links, a link reveals
-// nothing about other pages, and a restart (new secret) revokes every old link. Only .html files directly inside pages/ and videos/ are served.
+// nothing about other pages, and a restart (new secret) revokes every old link. With --secret-file the secret is read from that file
+// (made on the first start), so links stay valid across restarts until the file is deleted. Only .html files directly inside pages/ and videos/ are served.
 // A served page also gets a script (src/runtime/live.js) that listens on /e/<token>/<file>, with the page's own token: the stream says
 // only that the page file changed, and the page reloads.
 
@@ -9,7 +10,7 @@ import { createServer } from 'node:http';
 import { connect, isIP } from 'node:net';
 import { networkInterfaces, uptime } from 'node:os';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFileSync, writeFileSync, renameSync, rmSync, watch } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, rmSync, statSync, watch } from 'node:fs';
 import { lstat, realpath, readFile, stat } from 'node:fs/promises';
 import { join, resolve, dirname, basename, sep } from 'node:path';
 import { ensureHome } from './home.js';
@@ -108,6 +109,45 @@ export class ServeError extends Error {
 }
 
 const infoPath = (home) => join(home, 'serve.json');
+
+// A secret is 32 random bytes as 64 lowercase hex characters. A secret file holds one, with an optional line ending.
+const newSecret = () => randomBytes(32).toString('hex');
+const SECRET_FILE_CONTENT = /^[0-9a-f]{64}(\r?\n)?$/;
+// Windows has no POSIX file modes (Node reports 0o666), so only POSIX checks that group and others cannot read the file.
+const checksMode = process.platform !== 'win32';
+
+// The secret in the file at path. A missing file is made with a new secret (mode 0600) and that secret is returned, so the next start
+// gives the same links. A file that is not a regular file, that group or others can read, or that holds anything else is refused:
+// the server does not start rather than serve with a secret that others can read or that is not the one you meant.
+export function readSecretFile(path) {
+  const file = resolve(path);
+  const read = () => {
+    const info = statSync(file); // follows a symlink, as in a mounted secret
+    if (!info.isFile()) throw new ServeError(`--secret-file ${file} is not a regular file`);
+    if (checksMode && (info.mode & 0o077) !== 0) {
+      throw new ServeError(`--secret-file ${file} can be read by other users (mode ${(info.mode & 0o777).toString(8)}); run chmod 600 on it`);
+    }
+    if (info.size > 128) throw new ServeError(`--secret-file ${file} does not hold a secret: expected 64 hex characters (0-9, a-f)`);
+    const text = readFileSync(file, 'utf8');
+    if (!SECRET_FILE_CONTENT.test(text)) throw new ServeError(`--secret-file ${file} does not hold a secret: expected 64 hex characters (0-9, a-f)`);
+    return text.slice(0, 64);
+  };
+  try {
+    return read();
+  } catch (e) {
+    if (e instanceof ServeError) throw e;
+    if (e.code !== 'ENOENT') throw new ServeError(`Cannot read --secret-file ${file}: ${e.message}`);
+  }
+  const secret = newSecret();
+  try {
+    // wx: never write through a file or symlink that appeared after the check above.
+    writeFileSync(file, `${secret}\n`, { mode: 0o600, flag: 'wx' });
+  } catch (e) {
+    if (e.code === 'EEXIST') return read(); // another start made it first: use its secret
+    throw new ServeError(`Cannot create --secret-file ${file}: ${e.message}`);
+  }
+  return secret;
+}
 
 // The token of one page. dir is "pages" or "videos"; the CLI and the server both use this function.
 export function pageToken(secret, dir, file) {
@@ -406,8 +446,8 @@ function listening(port, timeout = 500) {
   });
 }
 
-// Default: loopback only. LAN listening and the public link origin are explicit opt-ins.
-export async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, lanAddresses }) {
+// Default: loopback only. LAN listening, the public link origin and a kept secret are explicit opt-ins.
+export async function startServer({ home, port = DEFAULT_PORT, lan = false, publicUrl, lanAddresses, secretFile }) {
   const addresses = lan ? (lanAddresses ?? lanIPv4Addresses()) : [];
   if (lan && (!addresses.length || addresses.some((address) => isIP(address) !== 4
     || address === LAN_BIND || address.startsWith('127.')))) {
@@ -417,7 +457,7 @@ export async function startServer({ home, port = DEFAULT_PORT, lan = false, publ
   const allowedHosts = [...addresses, ...(publicOrigin ? [new URL(publicOrigin).host] : [])];
   const running = readServeInfo(home);
   if (running && await listening(running.port)) throw new ServeError(`am serve is already running on ${running.baseUrl ?? `http://${HOST}:${running.port}`} (pid ${running.pid}); stop it first`);
-  const secret = randomBytes(32).toString('hex');
+  const secret = secretFile === undefined ? newSecret() : readSecretFile(secretFile);
   const live = liveStreams(home);
   const server = createServer(handler(home, secret, allowedHosts, live));
   await new Promise((done, fail) => {
@@ -450,10 +490,10 @@ export async function startServer({ home, port = DEFAULT_PORT, lan = false, publ
 }
 
 // am serve: run in the foreground until Ctrl-C / SIGTERM / SIGHUP. Resolves with the exit code.
-export async function runServe({ home, port, lan = false, publicUrl, print, fail }) {
+export async function runServe({ home, port, lan = false, publicUrl, secretFile, print, fail }) {
   let srv;
   try {
-    srv = await startServer({ home, port, lan, publicUrl });
+    srv = await startServer({ home, port, lan, publicUrl, secretFile });
   } catch (e) {
     if (!(e instanceof ServeError)) throw e;
     fail(`✗ ${e.message}`);
@@ -475,6 +515,7 @@ export async function runServe({ home, port, lan = false, publicUrl, print, fail
       // With --public-url a reverse proxy or tunnel already reaches the server, so the SSH hint would mislead.
       if (!publicUrl) print(`Reaching it from another computer: run ssh -L ${srv.port}:${HOST}:${srv.port} user@host there, then open the links in its browser.`);
     }
+    if (secretFile !== undefined) print(`Secret file: ${resolve(secretFile)}. Links stay valid after a restart; delete the file to revoke them all.`);
     if (publicUrl) {
       print(`Public link origin: ${srv.baseUrl}`);
       if (srv.baseUrl.startsWith('http://')) print('WARNING: --public-url uses HTTP; links and their capability tokens are not encrypted in transit.');
